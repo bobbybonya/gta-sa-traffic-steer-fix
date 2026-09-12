@@ -11,18 +11,41 @@ Previous attempts to force `STATUS_PHYSICS` in `CAutomobile::PreRender` caused g
 
 ---
 
-### The Solution
-This plugin bypasses the game's dormant steering logic and directly manipulates the RenderWare frames (`CAR_WHEEL_LF` and `CAR_WHEEL_RF`) right before rendering:
+### The Solution & Technical Deep Dive
 
-1. **Kinematic Steer Calculation:** Yaw rate is calculated dynamically from the vehicle matrix's forward vector delta:
-   $$\Delta\theta = \text{atan2}(Y_t, X_t) - \text{atan2}(Y_{t-1}, X_{t-1})$$
-   Target steering angle is derived using a bicycle kinematic model based on vehicle speed and wheel base.
-2. **Exponential Low-Pass Filter:** Smooths out jagged orientation changes caused by segmented navigation path nodes.
-3. **Axis-Correct Matrix Transformation:** 
-   - Translates wheel origin to $(0, 0, 0)$.
-   - Rotates around the vehicle's vertical axis (`car.at`), preserving natural forward wheel rolling.
-   - Translates back to the original hub position, preventing wheel detachment.
-4. **Zero-Drift Frame Restoration:** Original wheel matrices are backed up on `beforeRender` and restored on `afterRender`, eliminating floating-point accumulation errors.
+To achieve smooth and crash-free steering for traffic vehicles without altering their core physics status, this plugin implements a non-intrusive RenderWare matrix injection pipeline operating strictly during the render phase.
+
+#### 1. Why `STATUS_PHYSICS` Fails
+In vanilla San Andreas, ambient cars use `STATUS_SIMPLE`, which completely bypasses standard handling equations, collision mesh updates, and wheel turning logic. 
+* **The Crash Vector:** Forcing `STATUS_PHYSICS` on lightweight traffic models inside `CAutomobile::PreRender` causes hard engine crashes. Traffic objects lack initialized damage structures, suspension spring limits, and proper wheel inertia tensors required by the physics engine.
+* **The Matrix Artifacts:** Directly modifying wheel matrices without handling local coordinate spaces results in "wobbly wheels" or flat-tire tearing because rotations conflict with wheel rolling mechanics.
+
+#### 2. The RenderWare Matrix Pipeline (`RwFrame`)
+Instead of forcing physics, the plugin hooks into `vehicleRenderEvent.before` and intercepts the local frames of the front wheels (`CAR_WHEEL_LF` and `CAR_WHEEL_RF`).
+
+* **Kinematic Steer Calculation:** 
+  Since `m_fSteerAngle` is dead for `STATUS_SIMPLE` cars, the plugin calculates the vehicle's yaw rate dynamically by comparing the delta of the forward vector across frames:
+  $$\Delta\theta = \text{atan2}(Y_t, X_t) - \text{atan2}(Y_{t-1}, X_{t-1})$$
+  The target steering angle is derived using a bicycle kinematic model scaled by vehicle speed and a steering response multiplier ($2.6f$).
+
+* **Exponential Low-Pass Filtering:**
+  Ambient traffic follows segmented node paths in world space, causing sudden, jagged orientation updates. An exponential smoothing filter:
+  $$\text{Steer}_{smooth} += (\text{Target} - \text{Steer}_{smooth}) \cdot (1 - e^{-5.0 \cdot dt})$$
+  eliminates twitching and ensures smooth visual transitions.
+
+* **Axis-Correct Local Matrix Transformation:**
+  To rotate the wheel around its hub without detaching it from the axle or breaking rolling animations, a 3-step matrix operation is applied:
+  1. Translate the wheel matrix origin to local $(0, 0, 0)$.
+  2. Rotate around the vehicle's vertical axis (`car.at`).
+  3. Translate the matrix back to the original hub position (`pMat->pos`).
+  
+  ```cpp
+  RwV3d center = pMat->pos;
+  RwV3d invCenter = { -center.x, -center.y, -center.z };
+  RwMatrixTranslate(pMat, &invCenter, rwCOMBINEPOSTCONCAT);
+  RwMatrixRotate(pMat, &axis, fAngleDeg, rwCOMBINEPOSTCONCAT);
+  RwMatrixTranslate(pMat, &center, rwCOMBINEPOSTCONCAT);
+  RwFrameUpdateObjects(pFrame);
 
 ---
 
